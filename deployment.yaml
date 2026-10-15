@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: college-events-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: college-events
+  template:
+    metadata:
+      labels:
+        app: college-events
+    spec:
+      containers:
+        - name: college-events-container
+          image: hsri123/college-events:v1
+          ports:
+            - containerPort: 80
