@@ -4,19 +4,16 @@ pipeline {
 
     options {
         timestamps()
-        skipDefaultCheckout(true)
-        disableConcurrentBuilds()
-        timeout(time: 15, unit: 'MINUTES')
+        timeout(time: 20, unit: 'MINUTES')
     }
 
     environment {
-        DOCKER_IMAGE = 'hsri123/college-events'
-        DEPLOYMENT_NAME = 'college-events-deployment'
-        SERVICE_NAME = 'college-events-service'
-        CONTAINER_NAME = 'college-events-container'
-        APP_LABEL = 'college-events'
-
         DOCKER_BIN = 'C:\\Users\\srish\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin'
+        IMAGE_NAME = 'hsri123/college-events'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        K8S_DEPLOYMENT = 'college-events-deployment'
+        K8S_CONTAINER = 'college-events-container'
+        DOCKER_CONFIG = "${WORKSPACE}\\.docker-jenkins"
     }
 
     stages {
@@ -29,11 +26,13 @@ pipeline {
                 bat '''
                     @echo off
                     echo Checking project files...
+
                     if not exist index.html exit /b 1
                     if not exist style.css exit /b 1
                     if not exist Dockerfile exit /b 1
                     if not exist deployment.yaml exit /b 1
                     if not exist service.yaml exit /b 1
+
                     echo All required project files found.
                 '''
             }
@@ -43,16 +42,7 @@ pipeline {
             steps {
                 bat '''
                     @echo off
-
-                    if not exist "%DOCKER_BIN%\\docker.exe" (
-                        echo ERROR: docker.exe not found at %DOCKER_BIN%
-                        exit /b 1
-                    )
-
                     "%DOCKER_BIN%\\docker.exe" version
-                    if errorlevel 1 exit /b 1
-
-                    "%DOCKER_BIN%\\docker.exe" info
                     if errorlevel 1 exit /b 1
                 '''
             }
@@ -62,11 +52,12 @@ pipeline {
             steps {
                 bat '''
                     @echo off
+                    echo Building College Event Management image...
 
-                    "%DOCKER_BIN%\\docker.exe" build -t %DOCKER_IMAGE%:%BUILD_NUMBER% .
-                    if errorlevel 1 exit /b 1
+                    "%DOCKER_BIN%\\docker.exe" build ^
+                        -t "%IMAGE_NAME%:%IMAGE_TAG%" ^
+                        -t "%IMAGE_NAME%:latest" .
 
-                    "%DOCKER_BIN%\\docker.exe" tag %DOCKER_IMAGE%:%BUILD_NUMBER% %DOCKER_IMAGE%:latest
                     if errorlevel 1 exit /b 1
 
                     echo Docker image built successfully.
@@ -78,8 +69,10 @@ pipeline {
             steps {
                 bat '''
                     @echo off
+                    echo Checking the built image...
 
-                    "%DOCKER_BIN%\\docker.exe" image inspect %DOCKER_IMAGE%:%BUILD_NUMBER%
+                    "%DOCKER_BIN%\\docker.exe" image inspect "%IMAGE_NAME%:%IMAGE_TAG%"
+
                     if errorlevel 1 exit /b 1
 
                     echo Application image exists.
@@ -96,33 +89,38 @@ pipeline {
                         passwordVariable: 'DOCKER_TOKEN'
                     )
                 ]) {
-                    bat '''
-                        @echo off
-                        setlocal DisableDelayedExpansion
+                    script {
+                        bat '''
+                            @echo off
+                            if exist "%DOCKER_CONFIG%" rmdir /s /q "%DOCKER_CONFIG%"
+                            mkdir "%DOCKER_CONFIG%"
+                        '''
 
-                        set "TOKENFILE=%WORKSPACE%\\docker-token.txt"
-                        <nul set /p "=%DOCKER_TOKEN%" > "%TOKENFILE%"
+                        withEnv(["DOCKER_CONFIG=${env.DOCKER_CONFIG}"]) {
+                            bat '''
+                                @echo off
+                                echo Authenticating with Docker Hub...
 
-                        "%DOCKER_BIN%\\docker.exe" login --username "%DOCKER_USER%" --password-stdin < "%TOKENFILE%"
-                        set "LOGIN_STATUS=%ERRORLEVEL%"
-                        del "%TOKENFILE%" 2>nul
+                                powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:DOCKER_TOKEN | & (Join-Path $env:DOCKER_BIN 'docker.exe') login --username $env:DOCKER_USER --password-stdin"
 
-                        if not "%LOGIN_STATUS%"=="0" exit /b 1
+                                if errorlevel 1 exit /b 1
 
-                        "%DOCKER_BIN%\\docker.exe" push %DOCKER_IMAGE%:%BUILD_NUMBER%
-                        if errorlevel 1 (
-                            "%DOCKER_BIN%\\docker.exe" logout
-                            exit /b 1
-                        )
+                                echo Pushing versioned image...
 
-                        "%DOCKER_BIN%\\docker.exe" push %DOCKER_IMAGE%:latest
-                        if errorlevel 1 (
-                            "%DOCKER_BIN%\\docker.exe" logout
-                            exit /b 1
-                        )
+                                "%DOCKER_BIN%\\docker.exe" push "%IMAGE_NAME%:%IMAGE_TAG%"
 
-                        "%DOCKER_BIN%\\docker.exe" logout
-                    '''
+                                if errorlevel 1 exit /b 1
+
+                                echo Pushing latest image...
+
+                                "%DOCKER_BIN%\\docker.exe" push "%IMAGE_NAME%:latest"
+
+                                if errorlevel 1 exit /b 1
+
+                                echo Docker Hub push completed successfully.
+                            '''
+                        }
+                    }
                 }
             }
         }
@@ -135,69 +133,40 @@ pipeline {
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
-                    script {
-                        int deployResult = 0
+                    bat '''
+                        @echo off
+                        echo Checking Kubernetes connection...
 
-                        try {
-                            deployResult = bat(
-                                returnStatus: true,
-                                script: '''
-                                    @echo off
-                                    set "KUBECONFIG=%KUBECONFIG_FILE%"
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" get nodes
 
-                                    if not exist "%DOCKER_BIN%\\kubectl.exe" (
-                                        echo ERROR: kubectl.exe not found.
-                                        exit /b 1
-                                    )
+                        if errorlevel 1 exit /b 1
 
-                                    "%DOCKER_BIN%\\kubectl.exe" get nodes
-                                    if errorlevel 1 exit /b 1
+                        echo Applying Kubernetes Deployment...
 
-                                    "%DOCKER_BIN%\\kubectl.exe" apply -f deployment.yaml
-                                    if errorlevel 1 exit /b 1
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" apply -f deployment.yaml
 
-                                    "%DOCKER_BIN%\\kubectl.exe" apply -f service.yaml
-                                    if errorlevel 1 exit /b 1
+                        if errorlevel 1 exit /b 1
 
-                                    "%DOCKER_BIN%\\kubectl.exe" set image deployment/%DEPLOYMENT_NAME% %CONTAINER_NAME%=%DOCKER_IMAGE%:%BUILD_NUMBER%
-                                    if errorlevel 1 exit /b 1
+                        echo Applying Kubernetes Service...
 
-                                    "%DOCKER_BIN%\\kubectl.exe" rollout status deployment/%DEPLOYMENT_NAME% --timeout=150s
-                                    if errorlevel 1 exit /b 1
-                                '''
-                            )
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" apply -f service.yaml
 
-                            if (deployResult != 0) {
-                                echo 'Deployment failed. Attempting automatic rollback.'
+                        if errorlevel 1 exit /b 1
 
-                                int rollbackResult = bat(
-                                    returnStatus: true,
-                                    script: '''
-                                        @echo off
-                                        set "KUBECONFIG=%KUBECONFIG_FILE%"
+                        echo Updating deployment to the new image...
 
-                                        "%DOCKER_BIN%\\kubectl.exe" rollout undo deployment/%DEPLOYMENT_NAME%
-                                        if errorlevel 1 exit /b 1
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" set image deployment/%K8S_DEPLOYMENT% %K8S_CONTAINER%=%IMAGE_NAME%:%IMAGE_TAG%
 
-                                        "%DOCKER_BIN%\\kubectl.exe" rollout status deployment/%DEPLOYMENT_NAME% --timeout=150s
-                                        if errorlevel 1 exit /b 1
-                                    '''
-                                )
+                        if errorlevel 1 exit /b 1
 
-                                if (rollbackResult != 0) {
-                                    error('Deployment failed and rollback could not be verified.')
-                                }
+                        echo Waiting for deployment rollout...
 
-                                error('Deployment failed. Previous release restored.')
-                            }
-                        } catch (err) {
-                            if (deployResult == 0) {
-                                throw err
-                            }
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" rollout status deployment/%K8S_DEPLOYMENT% --timeout=180s
 
-                            throw err
-                        }
-                    }
+                        if errorlevel 1 exit /b 1
+
+                        echo Kubernetes deployment completed successfully.
+                    '''
                 }
             }
         }
@@ -212,27 +181,25 @@ pipeline {
                 ]) {
                     bat '''
                         @echo off
-                        set "KUBECONFIG=%KUBECONFIG_FILE%"
+                        echo Checking deployment status...
 
-                        echo ===== Deployment =====
-                        "%DOCKER_BIN%\\kubectl.exe" get deployment %DEPLOYMENT_NAME%
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" get deployment %K8S_DEPLOYMENT%
+
                         if errorlevel 1 exit /b 1
 
-                        echo ===== Pods =====
-                        "%DOCKER_BIN%\\kubectl.exe" get pods -l app=%APP_LABEL% -o wide
+                        echo Checking application pods...
+
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" get pods -l app=college-events
+
                         if errorlevel 1 exit /b 1
 
-                        echo ===== Service =====
-                        "%DOCKER_BIN%\\kubectl.exe" get service %SERVICE_NAME%
+                        echo Checking Kubernetes Service...
+
+                        "%DOCKER_BIN%\\kubectl.exe" --kubeconfig="%KUBECONFIG_FILE%" get service college-events-service
+
                         if errorlevel 1 exit /b 1
 
-                        echo ===== Rollout Status =====
-                        "%DOCKER_BIN%\\kubectl.exe" rollout status deployment/%DEPLOYMENT_NAME% --timeout=120s
-                        if errorlevel 1 exit /b 1
-
-                        echo ===== Ready Replicas =====
-                        "%DOCKER_BIN%\\kubectl.exe" get deployment %DEPLOYMENT_NAME% -o jsonpath="{.status.readyReplicas}"
-                        echo.
+                        echo Deployment verification completed.
                     '''
                 }
             }
@@ -241,11 +208,12 @@ pipeline {
 
     post {
         success {
-            echo 'SUCCESS: Application built, pushed, deployed and verified.'
+            echo 'SUCCESS: College Event Management pipeline completed.'
+            echo 'Docker image pushed and Kubernetes deployment verified.'
         }
 
         failure {
-            echo 'FAILURE: Inspect the first failed stage in Console Output.'
+            echo 'FAILURE: Open Console Output and inspect the first failed stage.'
         }
 
         always {
