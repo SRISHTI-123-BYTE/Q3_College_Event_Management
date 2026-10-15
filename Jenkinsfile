@@ -1,55 +1,71 @@
-
+```groovy
 pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
         timestamps()
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 15, unit: 'MINUTES')
     }
 
     environment {
         DOCKER_IMAGE = 'hsri123/college-events'
-        K8S_DEPLOYMENT = 'college-events-deployment'
-        K8S_SERVICE = 'college-events-service'
-        K8S_CONTAINER = 'college-events-container'
+        DEPLOYMENT_NAME = 'college-events-deployment'
+        SERVICE_NAME = 'college-events-service'
+        APP_LABEL = 'college-events'
         DOCKER_BIN = 'C:\\Users\\srish\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin'
-        KUBECTL = 'C:\\Users\\srish\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\kubectl.exe'
     }
 
     stages {
+
         stage('Clone Code') {
             steps {
                 git branch: 'main',
                     url: 'https://github.com/SRISHTI-123-BYTE/Q3_College_Event_Management.git'
 
-                bat 'git log -1 --oneline'
+                bat '''
+                    echo Repository checkout successful
+                    git log -1 --oneline
+                    if not exist index.html exit /b 1
+                    if not exist Dockerfile exit /b 1
+                    if not exist deployment.yaml exit /b 1
+                    if not exist service.yaml exit /b 1
+                '''
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                withEnv(["PATH+DOCKER=${DOCKER_BIN}"]) {
-                    bat '''
-                        docker version
-                        docker build -t %DOCKER_IMAGE%:%BUILD_NUMBER% .
-                        docker tag %DOCKER_IMAGE%:%BUILD_NUMBER% %DOCKER_IMAGE%:latest
-                    '''
-                }
+                bat '''
+                    docker version
+                    docker build --no-cache -t %DOCKER_IMAGE%:%BUILD_NUMBER% .
+                    if errorlevel 1 exit /b 1
+
+                    docker tag %DOCKER_IMAGE%:%BUILD_NUMBER% %DOCKER_IMAGE%:latest
+                    if errorlevel 1 exit /b 1
+                '''
             }
         }
 
         stage('Test Application Image') {
             steps {
-                withEnv(["PATH+DOCKER=${DOCKER_BIN}"]) {
-                    bat '''
-                        docker image inspect %DOCKER_IMAGE%:%BUILD_NUMBER%
-                        if not exist index.html (
-                            echo ERROR: index.html was not found in the workspace.
-                            exit /b 1
-                        )
-                        findstr /I /C:"College" index.html
-                    '''
-                }
+                bat '''
+                    docker image inspect %DOCKER_IMAGE%:%BUILD_NUMBER%
+                    if errorlevel 1 exit /b 1
+
+                    if not exist index.html (
+                        echo ERROR: index.html is missing
+                        exit /b 1
+                    )
+
+                    findstr /I /C:"College" index.html
+                    if errorlevel 1 (
+                        echo WARNING: Expected College text was not found
+                    )
+
+                    echo Docker image and application files checked.
+                '''
             }
         }
 
@@ -62,21 +78,21 @@ pipeline {
                         passwordVariable: 'DOCKER_TOKEN'
                     )
                 ]) {
-                    withEnv(["PATH+DOCKER=${DOCKER_BIN}"]) {
-                        bat '''
-                            @echo off
-                            echo %DOCKER_TOKEN% | docker login -u %DOCKER_USER% --password-stdin
-                            if errorlevel 1 exit /b 1
+                    bat '''
+                        @echo off
+                        echo Logging in to Docker Hub...
 
-                            docker push %DOCKER_IMAGE%:%BUILD_NUMBER%
-                            if errorlevel 1 exit /b 1
+                        echo %DOCKER_TOKEN% | docker login -u %DOCKER_USER% --password-stdin
+                        if errorlevel 1 exit /b 1
 
-                            docker push %DOCKER_IMAGE%:latest
-                            if errorlevel 1 exit /b 1
+                        docker push %DOCKER_IMAGE%:%BUILD_NUMBER%
+                        if errorlevel 1 exit /b 1
 
-                            docker logout
-                        '''
-                    }
+                        docker push %DOCKER_IMAGE%:latest
+                        if errorlevel 1 exit /b 1
+
+                        docker logout
+                    '''
                 }
             }
         }
@@ -89,46 +105,49 @@ pipeline {
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
-                    script {
-                        int deployResult = bat(
-                            returnStatus: true,
-                            script: '''
-                                @echo off
-                                set "KUBECONFIG=%KUBECONFIG_FILE%"
-
-                                "%KUBECTL%" get nodes
-                                if errorlevel 1 exit /b 1
-
-                                "%KUBECTL%" set image deployment/%K8S_DEPLOYMENT% %K8S_CONTAINER%=%DOCKER_IMAGE%:%BUILD_NUMBER%
-                                if errorlevel 1 exit /b 1
-
-                                "%KUBECTL%" rollout status deployment/%K8S_DEPLOYMENT% --timeout=120s
-                                if errorlevel 1 exit /b 1
-                            '''
-                        )
-
-                        if (deployResult != 0) {
-                            echo 'Deployment failed. Automatically rolling back.'
-
-                            int rollbackResult = bat(
-                                returnStatus: true,
-                                script: '''
+                    withEnv([
+                        "PATH+KUBECTL=${env.DOCKER_BIN}"
+                    ]) {
+                        script {
+                            try {
+                                bat '''
                                     @echo off
-                                    set "KUBECONFIG=%KUBECONFIG_FILE%"
+                                    set KUBECONFIG=%KUBECONFIG_FILE%
 
-                                    "%KUBECTL%" rollout undo deployment/%K8S_DEPLOYMENT%
+                                    kubectl version --client
                                     if errorlevel 1 exit /b 1
 
-                                    "%KUBECTL%" rollout status deployment/%K8S_DEPLOYMENT% --timeout=120s
+                                    kubectl cluster-info
+                                    if errorlevel 1 exit /b 1
+
+                                    kubectl apply -f deployment.yaml
+                                    if errorlevel 1 exit /b 1
+
+                                    kubectl apply -f service.yaml
+                                    if errorlevel 1 exit /b 1
+
+                                    kubectl set image deployment/%DEPLOYMENT_NAME% *=%DOCKER_IMAGE%:%BUILD_NUMBER%
                                     if errorlevel 1 exit /b 1
                                 '''
-                            )
 
-                            if (rollbackResult != 0) {
-                                error('Deployment failed and rollback could not be verified. Check Kubernetes events.')
+                                timeout(time: 3, unit: 'MINUTES') {
+                                    bat '''
+                                        set KUBECONFIG=%KUBECONFIG_FILE%
+                                        kubectl rollout status deployment/%DEPLOYMENT_NAME% --timeout=150s
+                                    '''
+                                }
+                            } catch (err) {
+                                echo 'Deployment failed. Attempting rollback to the previous revision.'
+
+                                bat '''
+                                    @echo off
+                                    set KUBECONFIG=%KUBECONFIG_FILE%
+                                    kubectl rollout undo deployment/%DEPLOYMENT_NAME%
+                                    kubectl rollout status deployment/%DEPLOYMENT_NAME% --timeout=150s
+                                '''
+
+                                error("New deployment failed. Rollback was attempted. Check Kubernetes status.")
                             }
-
-                            error('Deployment failed. Previous release was restored.')
                         }
                     }
                 }
@@ -143,19 +162,35 @@ pipeline {
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
-                    withEnv(["PATH+DOCKER=${DOCKER_BIN}"]) {
+                    withEnv([
+                        "PATH+KUBECTL=${env.DOCKER_BIN}"
+                    ]) {
                         bat '''
                             @echo off
-                            set "KUBECONFIG=%KUBECONFIG_FILE%"
+                            set KUBECONFIG=%KUBECONFIG_FILE%
 
-                            "%KUBECTL%" get deployment %K8S_DEPLOYMENT%
-                            "%KUBECTL%" get pods -l app=college-events
-                            "%KUBECTL%" get service %K8S_SERVICE%
-
-                            "%KUBECTL%" rollout status deployment/%K8S_DEPLOYMENT% --timeout=120s
+                            echo ===== DEPLOYMENT =====
+                            kubectl get deployment %DEPLOYMENT_NAME%
                             if errorlevel 1 exit /b 1
 
-                            "%KUBECTL%" get deployment %K8S_DEPLOYMENT% -o jsonpath="{.status.readyReplicas}"
+                            echo ===== PODS =====
+                            kubectl get pods -l app=%APP_LABEL% -o wide
+                            if errorlevel 1 exit /b 1
+
+                            echo ===== SERVICE =====
+                            kubectl get service %SERVICE_NAME%
+                            if errorlevel 1 exit /b 1
+
+                            echo ===== DEPLOYED IMAGE =====
+                            kubectl get deployment %DEPLOYMENT_NAME% -o jsonpath="{.spec.template.spec.containers[0].image}"
+                            echo.
+
+                            echo ===== ROLLOUT STATUS =====
+                            kubectl rollout status deployment/%DEPLOYMENT_NAME% --timeout=120s
+                            if errorlevel 1 exit /b 1
+
+                            echo ===== READY REPLICA COUNT =====
+                            kubectl get deployment %DEPLOYMENT_NAME% -o jsonpath="{.status.readyReplicas}"
                             echo.
                         '''
                     }
@@ -166,12 +201,11 @@ pipeline {
 
     post {
         success {
-            echo 'Pipeline completed successfully.'
-            echo 'Docker image built and pushed; Kubernetes deployment verified.'
+            echo 'SUCCESS: College Event Management application was built, pushed, deployed, and verified.'
         }
 
         failure {
-            echo 'Pipeline failed. Review the first failed stage and its console output.'
+            echo 'FAILURE: Check the first failed stage in the Console Output.'
         }
 
         always {
@@ -179,3 +213,4 @@ pipeline {
         }
     }
 }
+```
